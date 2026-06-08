@@ -1,62 +1,84 @@
+const RESULT_FIELD = process.env.RESULT_FIELD || "UF_AUTO_193837238782";
+const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
+
 function setDeep(obj, key, value) {
   const parts = key.replace(/\]/g, "").split("[");
   let cur = obj;
 
   for (let i = 0; i < parts.length - 1; i++) {
-    const p = parts[i];
-    if (!cur[p]) cur[p] = {};
-    cur = cur[p];
+    const part = parts[i];
+    if (!cur[part]) cur[part] = {};
+    cur = cur[part];
   }
 
   cur[parts[parts.length - 1]] = value;
 }
 
-function normalizePayload(body) {
+function normalizeBody(body) {
   if (!body) return {};
-
-  if (typeof body === "string") {
-    const obj = {};
-    const params = new URLSearchParams(body);
-    for (const [key, value] of params.entries()) {
-      if (key.includes("[")) setDeep(obj, key, value);
-      else obj[key] = value;
-    }
-    return obj;
-  }
 
   if (typeof body === "object") {
     const obj = {};
     for (const [key, value] of Object.entries(body)) {
-      if (key.includes("[")) setDeep(obj, key, value);
-      else obj[key] = value;
+      if (key.includes("[")) {
+        setDeep(obj, key, value);
+      } else {
+        obj[key] = value;
+      }
     }
+    return obj;
+  }
+
+  if (typeof body === "string") {
+    const obj = {};
+    const params = new URLSearchParams(body);
+
+    for (const [key, value] of params.entries()) {
+      if (key.includes("[")) {
+        setDeep(obj, key, value);
+      } else {
+        obj[key] = value;
+      }
+    }
+
     return obj;
   }
 
   return {};
 }
 
-function getFirstCommand(payload) {
-  const commands = payload?.data?.COMMAND;
+function findText(payload) {
+  const candidates = [
+    payload?.data?.COMMAND?.result?.COMMAND_PARAMS,
+    payload?.data?.COMMAND?.["26"]?.COMMAND_PARAMS,
+    payload?.data?.COMMAND_PARAMS,
+    payload?.COMMAND_PARAMS,
+    payload?.command_params,
+    payload?.PARAMS,
+    payload?.data?.PARAMS?.MESSAGE
+  ];
 
-  if (!commands || typeof commands !== "object") {
-    return null;
+  for (const value of candidates) {
+    if (value && String(value).trim()) {
+      return String(value)
+        .replace(/^\/result\s*/i, "")
+        .trim();
+    }
   }
 
-  const firstKey = Object.keys(commands)[0];
-  return commands[firstKey] || null;
+  return "";
 }
 
-function extractTaskId(payload) {
-  const params = payload?.data?.PARAMS || {};
-
+function findTaskId(payload) {
   const candidates = [
-    params.CHAT_ENTITY_ID,
-    params.chat_entity_id,
+    payload?.data?.PARAMS?.CHAT_ENTITY_ID,
+    payload?.data?.PARAMS?.CHAT_ENTITY_DATA_1,
+    payload?.data?.PARAMS?.CHAT_ENTITY_DATA_2,
     payload?.CHAT_ENTITY_ID,
-    payload?.chat_entity_id,
-    payload?.taskId,
-    payload?.TASK_ID
+    payload?.CHAT_ENTITY_DATA_1,
+    payload?.CHAT_ENTITY_DATA_2,
+    payload?.TASK_ID,
+    payload?.taskId
   ];
 
   for (const value of candidates) {
@@ -69,117 +91,89 @@ function extractTaskId(payload) {
   return "";
 }
 
-function extractCommandText(payload) {
-  const command = getFirstCommand(payload);
+module.exports = async function handler(req, res) {
+  console.log("=== FLOWDESK HANDLER START ===");
+  console.log("METHOD:", req.method);
+  console.log("QUERY:", JSON.stringify(req.query));
+  console.log("BODY RAW:", JSON.stringify(req.body));
 
-  const candidates = [
-    command?.COMMAND_PARAMS,
-    command?.command_params,
-    payload?.COMMAND_PARAMS,
-    payload?.command_params,
-    payload?.data?.COMMAND_PARAMS,
-    payload?.data?.command_params
-  ];
-
-  for (const value of candidates) {
-    if (value && String(value).trim()) {
-      return String(value).trim();
-    }
-  }
-
-  const fullMessage = payload?.data?.PARAMS?.MESSAGE || "";
-  return String(fullMessage)
-    .replace(/^\/result\s*/i, "")
-    .trim();
-}
-
-export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      message: "FlowDesk result handler is alive"
+      message: "handler alive"
     });
   }
 
   try {
-    const payload = normalizePayload(req.body);
+    const payload = normalizeBody(req.body);
 
-    console.log("QUERY:", JSON.stringify(req.query, null, 2));
     console.log("PAYLOAD:", JSON.stringify(payload, null, 2));
 
-    const bitrixBase = process.env.BITRIX_WEBHOOK_URL;
-    const resultField = process.env.RESULT_FIELD || "UF_AUTO_193837238782";
+    const text = findText(payload);
+    const taskId = findTaskId(payload);
 
-    if (!bitrixBase) {
+    console.log("EXTRACTED:", JSON.stringify({
+      taskId,
+      text,
+      resultField: RESULT_FIELD
+    }));
+
+    if (!BITRIX_WEBHOOK_URL) {
       return res.status(200).json({
         ok: false,
-        error: "missing_BITRIX_WEBHOOK_URL"
-      });
-    }
-
-    const text = extractCommandText(payload);
-    const taskId = extractTaskId(payload);
-
-    console.log("EXTRACTED:", JSON.stringify({ taskId, text, resultField }, null, 2));
-
-    if (!text) {
-      return res.status(200).json({
-        ok: false,
-        error: "empty_command_text",
-        hint: "Пиши так: /result текст результата"
+        error: "BITRIX_WEBHOOK_URL is empty"
       });
     }
 
     if (!taskId) {
       return res.status(200).json({
         ok: false,
-        error: "task_id_not_found",
-        hint: "Не нашли ID задачи в CHAT_ENTITY_ID. Смотри PAYLOAD в логах."
+        error: "taskId not found",
+        payload
       });
     }
 
-    const base = bitrixBase.endsWith("/") ? bitrixBase : bitrixBase + "/";
+    if (!text) {
+      return res.status(200).json({
+        ok: false,
+        error: "text not found",
+        payload
+      });
+    }
 
-    const response = await fetch(base + "tasks.task.update.json", {
+    const base = BITRIX_WEBHOOK_URL.endsWith("/")
+      ? BITRIX_WEBHOOK_URL
+      : BITRIX_WEBHOOK_URL + "/";
+
+    const bitrixResponse = await fetch(base + "tasks.task.update.json", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json"
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         taskId: Number(taskId),
         fields: {
-          [resultField]: text
+          [RESULT_FIELD]: text
         }
       })
     });
 
-    const json = await response.json();
+    const bitrixJson = await bitrixResponse.json();
 
-    console.log("BITRIX_UPDATE_RESPONSE:", JSON.stringify(json, null, 2));
-
-    if (json.error) {
-      return res.status(200).json({
-        ok: false,
-        error: json.error,
-        description: json.error_description,
-        bitrix: json
-      });
-    }
+    console.log("BITRIX RESPONSE:", JSON.stringify(bitrixJson, null, 2));
 
     return res.status(200).json({
       ok: true,
       taskId,
-      field: resultField,
-      savedText: text
+      text,
+      bitrix: bitrixJson
     });
   } catch (error) {
-    console.error("HANDLER_ERROR:", error);
+    console.error("ERROR:", error);
 
     return res.status(200).json({
       ok: false,
-      error: "handler_failed",
-      message: error.message
+      error: error.message
     });
   }
-}
+};
