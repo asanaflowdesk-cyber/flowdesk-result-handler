@@ -61,7 +61,7 @@ function findText(payload) {
   for (const value of candidates) {
     if (value && String(value).trim()) {
       return String(value)
-        .replace(/^\/результат\s*/i, "")
+        .replace(/^\/(result|результат)\s*/i, "")
         .trim();
     }
   }
